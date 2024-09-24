@@ -40,7 +40,7 @@ tc_data = loaders.TCState()
 
 def check_nan(*values) -> bool:
     for value in values:
-        if math.isnan(value):
+        if math.isnan(value) or math.isinf(value):
             return True
     return False
 
@@ -151,8 +151,11 @@ class ServerConnection(BaseConnection):
             # Existingplayer may only be sent if in the limbo or spectator
             # modes. Without this check, they could respawn themselves
             # instantly on any team they wanted.
-            log.debug("{} tried sending an ExistingPlayer packet while not in"
-                      " limbo or spectator mode".format(self))
+            log.debug(
+                ("{player!r} tried sending an ExistingPlayer packet while not"
+                 " in limbo or spectator mode"),
+                player=self
+            )
             return
 
         old_team = self.team
@@ -418,9 +421,13 @@ class ServerConnection(BaseConnection):
         if contained.value > 3.0:
             contained.value = 3.0
         velocity = Vertex3(*contained.velocity) - self.world_object.velocity
-        if velocity.length() > 2.0:  # cap at tested maximum
+        length = velocity.length()
+        if check_nan(length):
+            return
+        if length > 2.0:  # cap at tested maximum
             velocity = velocity.normal() * 2.0
         velocity += self.world_object.velocity
+        contained.velocity = (velocity.x, velocity.y, velocity.z)
         if self.on_grenade(contained.value) == False:
             return
         grenade = self.protocol.world.create_object(
@@ -630,8 +637,10 @@ class ServerConnection(BaseConnection):
 
         value = contained.value
         if len(value) > 108:
-            log.info("TOO LONG MESSAGE (%i chars) FROM %s (#%i)" %
-                     (len(value), self.name, self.player_id))
+            log.info("TOO LONG MESSAGE ({chars} chars) FROM {name} (#{id})",
+                     chars=len(value),
+                     name=self.name,
+                     id=self.player_id)
 
         value = value[:108]
         if value.startswith('/'):
@@ -716,8 +725,9 @@ class ServerConnection(BaseConnection):
             log.debug("not sending version request to OpenSpades <= 0.1.3")
         else:
             ext_info = loaders.ProtocolExtensionInfo()
-            ext_info.extensions = []
+            ext_info.extensions = self.protocol.available_proto_extensions
             self.send_contained(ext_info)
+        self.on_client_info()
 
     @property
     def client_string(self):
@@ -975,16 +985,17 @@ class ServerConnection(BaseConnection):
         if by is not None and self.team is by.team:
             friendly_fire = self.protocol.friendly_fire
             friendly_fire_on_grief = self.protocol.friendly_fire_on_grief
-            if friendly_fire_on_grief and not friendly_fire:
-                if (kill_type == MELEE_KILL and
-                        not self.protocol.spade_teamkills_on_grief):
-                    return
-                hit_time = self.protocol.friendly_fire_time
-                if (self.last_block_destroy is None
-                        or reactor.seconds() - self.last_block_destroy >= hit_time):
-                    return
             if not friendly_fire:
-                return
+                if friendly_fire_on_grief:
+                    if (kill_type == MELEE_KILL and
+                            not self.protocol.spade_teamkills_on_grief):
+                        return
+                    hit_time = self.protocol.friendly_fire_time
+                    if (self.last_block_destroy is None
+                            or reactor.seconds() - self.last_block_destroy >= hit_time):
+                        return
+                else:
+                    return
         self.set_hp(self.hp - value, by, kill_type=kill_type)
 
     def set_hp(self, value: Union[int, float], hit_by: Optional['ServerConnection'] = None, kill_type: int = WEAPON_KILL,
@@ -1410,6 +1421,9 @@ class ServerConnection(BaseConnection):
         pass
 
     def on_animation_update(self, jump, crouch, sneak, sprint):
+        pass
+
+    def on_client_info(self):
         pass
 
     def __repr__(self):

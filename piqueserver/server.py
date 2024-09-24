@@ -56,7 +56,7 @@ from piqueserver.scheduler import Scheduler
 from piqueserver.utils import as_deferred, EndCall
 from piqueserver.bansubscribe import bans_config_urls
 from pyspades.bytes import NoDataLeft
-from pyspades.constants import CTF_MODE, ERROR_SHUTDOWN, TC_MODE
+from pyspades.constants import CTF_MODE, ERROR_SHUTDOWN, TC_MODE, EXTENSION_CHATTYPE
 from pyspades.master import MAX_SERVER_NAME_SIZE
 from pyspades.server import ServerProtocol, Team
 from pyspades.tools import make_server_identifier
@@ -107,7 +107,7 @@ cap_limit = config.option('cap_limit', default=10,
 advance_on_win = config.option('advance_on_win', default=False,
                                validate=lambda x: isinstance(x, bool))
 everyone_is_admin = config.option('everyone_is_admin', default=False,
-                               validate=lambda x: isinstance(x, bool))
+                                  validate=lambda x: isinstance(x, bool))
 team1_name = team1_config.option(
     'name', default='Blue', validate=validate_team_name)
 team2_name = team2_config.option(
@@ -173,6 +173,10 @@ tips_option = config.option('tips')
 network_interface = config.option('network_interface', default='')
 scripts_option = config.option(
     'scripts', default=[], validate=extensions.check_scripts)
+cmd_antispam_enable = config.option("enable_command_ratelimit", True)
+cmd_command_limit_size = config.option("command_ratelimit_amount", 4)
+cmd_command_limit_time = config.option(
+    "command_ratelimit_period", "5s", cast=cast_duration)
 
 
 def ensure_dir_exists(filename: str) -> None:
@@ -216,6 +220,7 @@ class FeatureProtocol(ServerProtocol):
     master = False
     ip = None
     identifier = None
+    command_antispam = False
 
     planned_map = None
 
@@ -254,7 +259,7 @@ class FeatureProtocol(ServerProtocol):
                     textFileLogObserver(logging_file), [predicate])
             ]
             globalLogBeginner.beginLoggingTo(observers)
-            log.info('piqueserver started on %s' % time.strftime('%c'))
+            log.info('piqueserver started on {time}', time=time.strftime('%c'))
 
         self.config = config_dict
         if random_rotation.get():
@@ -267,6 +272,8 @@ class FeatureProtocol(ServerProtocol):
         self.win_count = itertools.count(1)
         self.bans = NetworkDict()
 
+        self.available_proto_extensions = [(EXTENSION_CHATTYPE, 1)]
+
         # attempt to load a saved bans list
         try:
             with open(os.path.join(config.config_dir, bans_file.get()), 'r') as f:
@@ -276,15 +283,21 @@ class FeatureProtocol(ServerProtocol):
             log.debug("skip loading bans: file unavailable",
                       count=len(self.bans))
         except IOError as e:
-            log.error('Could not read bans file ({}): {}'.format(bans_file.get(), e))
+            log.error('Could not read bans file ({path}): {exception!r}',
+                      path=bans_file.get(),
+                      exception=e)
         except ValueError as e:
-            log.error('Could not parse bans file ({}): {}'.format(bans_file.get(), e))
+            log.error('Could not parse bans file ({path}): {exception!r}',
+                      path=bans_file.get(),
+                      exception=e)
 
         self.hard_bans = set()  # possible DDoS'ers are added here
         self.player_memory = deque(maxlen=100)
         if len(self.name) > MAX_SERVER_NAME_SIZE:
-            log.warn('(server name too long; it will be truncated to "%s")' % (
-                self.name[:MAX_SERVER_NAME_SIZE]))
+            log.warn(
+                '(server name too long; it will be truncated to "{name}")',
+                name=self.name[:MAX_SERVER_NAME_SIZE]
+            )
         self.respawn_time = respawn_time_option.get()
         self.respawn_waves = respawn_waves.get()
 
@@ -322,6 +335,9 @@ class FeatureProtocol(ServerProtocol):
         self.time_announcements = time_announcements.get()
         self.balanced_teams = balanced_teams.get()
         self.login_retries = login_retries.get()
+        self.command_antispam = cmd_antispam_enable.get()
+        self.command_limit_size = cmd_command_limit_size.get()
+        self.command_limit_time = cmd_command_limit_time.get()
 
         # voting configuration
         self.default_ban_time = default_ban_duration.get()
@@ -368,7 +384,8 @@ class FeatureProtocol(ServerProtocol):
         try:
             self.set_map_rotation(self.config['rotation'])
         except MapNotFound as e:
-            log.critical('Invalid map in map rotation (%s), exiting.' % e.map)
+            log.critical('Invalid map in map rotation ({name}), exiting.',
+                         name=e.map)
             raise SystemExit
 
         map_load_d = self.advance_rotation()
@@ -404,7 +421,11 @@ class FeatureProtocol(ServerProtocol):
 
     async def get_external_ip(self, ip_getter: str) -> Iterator[Deferred]:
         log.info(
-            'Retrieving external IP from {!r} to generate server identifier.'.format(ip_getter))
+            ('Retrieving external IP from {ip_getter} to generate server'
+             ' identifier.'),
+            ip_getter=ip_getter
+        )
+
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(ip_getter) as response:
@@ -420,8 +441,12 @@ class FeatureProtocol(ServerProtocol):
 
         self.ip = ip
         self.identifier = make_server_identifier(ip, self.port)
-        log.info('Server public ip address: {}:{}'.format(ip, self.port))
-        log.info('Public aos identifier: {}'.format(self.identifier))
+        log.info('Server public ip address: {ip}:{port}',
+                 ip=ip,
+                 port=self.port)
+
+        log.info('Public aos identifier: {identifier}',
+                 identifier=self.identifier)
 
     def set_time_limit(self, time_limit: Optional[int] = None, additive:
                        bool = False) -> Optional[int]:
@@ -461,10 +486,11 @@ class FeatureProtocol(ServerProtocol):
             if remaining < 10.001:
                 self.broadcast_chat('%s...' % int(round(remaining)))
             else:
-                self.broadcast_chat('%s seconds remaining.' % int(round(remaining)))
+                self.broadcast_chat('%s seconds remaining.' %
+                                    int(round(remaining)))
         else:
             self.broadcast_chat('%s minutes remaining.' %
-                           int(round(remaining / 60)))
+                                int(round(remaining / 60)))
 
     def _time_up(self):
         self.advance_call = None
@@ -603,7 +629,8 @@ class FeatureProtocol(ServerProtocol):
                 message = 'Master connection could not be established'
             else:
                 message = 'Master connection lost'
-            log.info('%s, reconnecting in 60 seconds...' % message)
+            log.info('{message}, reconnecting in 60 seconds...',
+                     message=message)
             self.master_reconnect_call = reactor.callLater(
                 60, self.reconnect_master)
 
@@ -678,7 +705,7 @@ class FeatureProtocol(ServerProtocol):
             self.new_release = await check_for_releases()
             if self.new_release:
                 log.info("#" * 60)
-                log.info(format_release(self.new_release))
+                log.info("{text}", text=format_release(self.new_release))
                 log.info("#" * 60)
             await asyncio.sleep(86400)  # 24 hrs
 
@@ -758,7 +785,8 @@ class FeatureProtocol(ServerProtocol):
                     "players_max": self.max_players,
                     "map": map_name,
                     "game_mode": self.get_mode_name(),
-                    "game_version": "0.75"
+                    "game_version": "0.75",
+                    "extensions": self.available_proto_extensions
                 }
                 payload = json.dumps(entry).encode()
                 self.host.socket.send(address, payload)
@@ -782,13 +810,17 @@ class FeatureProtocol(ServerProtocol):
             import traceback
             traceback.print_exc()
             log.info(
-                'IP %s was hardbanned for invalid data or possibly DDoS.' % ip)
+                'IP {ip} was hardbanned for invalid data or possibly DDoS.',
+                ip=ip
+            )
             self.hard_bans.add(ip)
             return
         dt = reactor.seconds() - current_time
         if dt > 1.0:
-            log.warn('processing {!r} from {} took {}'.format(
-                packet.data, ip, dt))
+            log.warn('processing {data!r} from {ip} took {time}',
+                     data=packet.data,
+                     ip=ip,
+                     time=dt)
 
     def irc_say(self, msg: str, me: bool = False) -> None:
         if self.irc_relay:
@@ -810,7 +842,8 @@ class FeatureProtocol(ServerProtocol):
         """
         if irc:
             self.irc_say('* %s' % value)
-        ServerProtocol.broadcast_chat(self, value, global_message, sender, team)
+        ServerProtocol.broadcast_chat(
+            self, value, global_message, sender, team)
 
     # backwards compatability
     def send_chat(self, *args, **kwargs):
@@ -827,14 +860,16 @@ class FeatureProtocol(ServerProtocol):
         if last_time is not None:
             dt = current_time - last_time
             if dt > 1.0:
-                log.warn('high CPU usage detected - %s' % dt)
+                log.warn('high CPU usage detected - {dt}', dt=dt)
         self.last_time = current_time
         ServerProtocol.update_world(self)
         time_taken = reactor.seconds() - current_time
         if time_taken > 1.0:
             log.warn(
-                'World update iteration took %s, objects: %s' %
-                (time_taken, self.world.objects))
+                'World update iteration took {time}, objects: {objects!r}',
+                time=time_taken,
+                objects=self.world.objects
+            )
 
     # events
 
